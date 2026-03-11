@@ -1,0 +1,1550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Golden Cinematic Xmas Tree - Embossed Edition ✨</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #020205; font-family: 'Segoe UI', sans-serif; }
+        #ui-overlay {
+            position: absolute; top: 20px; left: 20px; color: #FFD700;
+            background: rgba(0,0,0,0.6); padding: 15px; border-radius: 10px;
+            border: 1px solid #FFD700; pointer-events: none; backdrop-filter: blur(8px); z-index: 10;
+        }
+        #video-container {
+            position: absolute; bottom: 20px; right: 20px; width: 220px; height: 165px;
+            border-radius: 12px; overflow: hidden; border: 2px solid #FFD700; opacity: 0.6;
+        }
+        #video-feed { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+        .upload-btn {
+            position: absolute; top: 20px; right: 20px; padding: 12px 24px;
+            background: #FFD700; color: #000; border: none; border-radius: 8px;
+            cursor: pointer; font-weight: bold; transition: 0.3s; z-index: 10;
+        }
+        .upload-btn:hover { background: #fff; box-shadow: 0 0 20px #FFD700; }
+        #loading-screen {
+            position: fixed; top:0; left:0; width:100%; height:100%;
+            background: #000; color: #FFD700; display: flex;
+            justify-content: center; align-items: center; z-index: 100; font-size: 1.5rem;
+        }
+        #cinematic-vignette {
+            position: fixed; inset: 0; pointer-events: none; z-index: 2;
+            background:
+                radial-gradient(circle at 50% 15%, rgba(255, 226, 158, 0.18), rgba(255, 215, 0, 0.06) 20%, rgba(0, 0, 0, 0) 42%),
+                radial-gradient(circle at 50% 48%, rgba(0, 0, 0, 0) 54%, rgba(0, 0, 0, 0.32) 82%, rgba(0, 0, 0, 0.72) 100%);
+            mix-blend-mode: screen;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loading-screen">正在构建电影级几何圣诞梦境...</div>
+<div id="cinematic-vignette"></div>
+
+<div id="ui-overlay">
+    <div style="font-size: 1.3em; margin-bottom: 8px; font-weight: bold;">✨ Xu Design · Geometric Tree</div>
+    <div>状态: <span id="state-txt" style="color: #fff; text-shadow: 0 0 10px #FFD700;">初始化...</span></div>
+    <div style="font-size: 0.85em; margin-top: 12px; opacity: 0.9; line-height: 1.6;">
+        ✊ <b>握拳</b>：几何体聚集成塔 (TREE)<br>
+        🖐️ <b>张掌</b>：旋转挑选清晰照片 (SCATTER)<br>
+        👌 <b>捏合</b>：抓取离指尖最近的照片 (FOCUS)
+    </div>
+</div>
+
+<button class="upload-btn" onclick="document.getElementById('photo-input').click()">上传记忆碎片</button>
+<input type="file" id="photo-input" multiple accept="image/*" style="display:none">
+
+<div id="video-container"><video id="video-feed" autoplay playsinline muted></video></div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const MEMORY_PHOTOS = [
+    'fb2d5d629afc68c3f8dffd8afb30a398.jpg',
+    'f6093d34979018eafa022e0c8289d898.jpg'
+];
+
+const GEO_COUNT = 800;
+const STATE = { TREE: 'TREE', SCATTER: 'SCATTER', FOCUS: 'FOCUS' };
+let appState = STATE.TREE;
+let activePhoto = null;
+let lastHandPos = new THREE.Vector3();
+
+let smoothedLandmarks = null;
+let stableGesture = STATE.TREE;
+const gestureConfidence = {
+    TREE: 0,
+    SCATTER: 0,
+    FOCUS: 0
+};
+
+let scatterHandOffset = new THREE.Vector3();
+// ==================== 1. 场景环境 ====================
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x020205, 0.02);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+camera.position.set(0, 5, 45);
+const defaultCameraPos = new THREE.Vector3(0, 5, 45);
+const orbitLookAt = new THREE.Vector3(0, 5, 0);
+let orbitAngleCurrent = 0;
+let orbitAngleTarget = 0;
+const orbitBaseRadius = 45;
+const orbitBaseHeight = 5;
+
+// 临时向量复用，减少每帧 GC 抖动
+const tempPalmTarget = new THREE.Vector3();
+const tempPinchTarget = new THREE.Vector3();
+const tempScatterTargetOffset = new THREE.Vector3();
+const tempZeroVec = new THREE.Vector3();
+const tempCamTargetPos = new THREE.Vector3();
+const tempLocalFloat = new THREE.Vector3();
+const tempTargetPos = new THREE.Vector3();
+const tempPhotoScatterPos = new THREE.Vector3();
+const tempDustTargetPos = new THREE.Vector3();
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.16;
+renderer.setClearColor(0x020205, 1);
+renderer.domElement.style.position = 'fixed';
+renderer.domElement.style.inset = '0';
+renderer.domElement.style.zIndex = '0';
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.enablePan = false;
+
+// ==================== 2. 后期辉光 ====================
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloomPass = new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    1.42,
+    0.5,
+    0.13
+);
+composer.addPass(bloomPass);
+
+function createGlowTexture(
+    inner = 'rgba(255,244,214,1)',
+    mid = 'rgba(255,208,92,0.45)',
+    outer = 'rgba(255,190,40,0)'
+) {
+    const size = 256;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    g.addColorStop(0, inner);
+    g.addColorStop(0.24, mid);
+    g.addColorStop(1, outer);
+
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    return tex;
+}
+
+function createEmbossedTextTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 2200;
+    canvas.height = 640;
+    const ctx = canvas.getContext('2d');
+    const text = 'MERRY CHRISTMAS';
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2 + 8;
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '900 190px "Trebuchet MS", "Arial Black", sans-serif';
+
+    // 背后厚度阴影：制造“浮雕下沉/凸起”的假深度
+    ctx.lineWidth = 18;
+    ctx.strokeStyle = 'rgba(76, 48, 10, 0.42)';
+    ctx.strokeText(text, cx + 9, cy + 16);
+    ctx.fillStyle = 'rgba(115, 76, 18, 0.30)';
+    ctx.fillText(text, cx + 9, cy + 16);
+
+    // 第二层厚度
+    ctx.lineWidth = 12;
+    ctx.strokeStyle = 'rgba(96, 62, 14, 0.35)';
+    ctx.strokeText(text, cx + 5, cy + 9);
+
+    // 主体金属渐变
+    const metalGradient = ctx.createLinearGradient(0, 90, 0, canvas.height - 90);
+    metalGradient.addColorStop(0.00, '#f7e7b2');
+    metalGradient.addColorStop(0.16, '#dfbf6d');
+    metalGradient.addColorStop(0.34, '#b7862d');
+    metalGradient.addColorStop(0.50, '#f2d98f');
+    metalGradient.addColorStop(0.67, '#b68029');
+    metalGradient.addColorStop(0.86, '#d7b261');
+    metalGradient.addColorStop(1.00, '#f0ddb0');
+    ctx.fillStyle = metalGradient;
+    ctx.fillText(text, cx, cy);
+
+    // 主轮廓线
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(92, 60, 14, 0.42)';
+    ctx.strokeText(text, cx, cy);
+
+    // 顶部浮雕高光
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-atop';
+    const topHighlight = ctx.createLinearGradient(0, 80, 0, cy + 10);
+    topHighlight.addColorStop(0, 'rgba(255,255,240,0.45)');
+    topHighlight.addColorStop(0.35, 'rgba(255,250,230,0.18)');
+    topHighlight.addColorStop(1, 'rgba(255,250,230,0)');
+    ctx.fillStyle = topHighlight;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 底部哑光压暗
+    const lowerShade = ctx.createLinearGradient(0, cy - 10, 0, canvas.height - 50);
+    lowerShade.addColorStop(0, 'rgba(80,52,12,0)');
+    lowerShade.addColorStop(1, 'rgba(80,52,12,0.26)');
+    ctx.fillStyle = lowerShade;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // 拉丝纹理
+    for (let i = 0; i < 360; i++) {
+        const y = 105 + Math.random() * (canvas.height - 210);
+        const alpha = 0.02 + Math.random() * 0.024;
+        ctx.fillStyle = `rgba(255, 247, 220, ${alpha})`;
+        ctx.fillRect(270, y, canvas.width - 540, 1 + Math.random() * 1.1);
+    }
+
+    for (let i = 0; i < 140; i++) {
+        const x = 270 + Math.random() * (canvas.width - 540);
+        const alpha = 0.01 + Math.random() * 0.012;
+        ctx.fillStyle = `rgba(112, 82, 28, ${alpha})`;
+        ctx.fillRect(x, 118, 1, canvas.height - 236);
+    }
+    ctx.restore();
+
+    // 左上高光描边，强化凸起感
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = 'rgba(255, 247, 220, 0.30)';
+    ctx.strokeText(text, cx - 1.6, cy - 2.4);
+
+    // 右下内阴影描边
+    ctx.lineWidth = 3.5;
+    ctx.strokeStyle = 'rgba(92, 60, 14, 0.20)';
+    ctx.strokeText(text, cx + 1.6, cy + 2.2);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.needsUpdate = true;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+}
+
+function addPhotoFrame(photoMesh) {
+    const backPlate = new THREE.Mesh(
+        new THREE.BoxGeometry(7.5, 5.5, 0.18),
+        new THREE.MeshStandardMaterial({
+            color: 0xefe6d3,
+            roughness: 0.72,
+            metalness: 0.04
+        })
+    );
+    backPlate.position.z = -0.12;
+    photoMesh.add(backPlate);
+
+    const frameMat = new THREE.MeshStandardMaterial({
+        color: 0xa67c38,
+        roughness: 0.42,
+        metalness: 0.35
+    });
+
+    const top = new THREE.Mesh(new THREE.BoxGeometry(7.68, 0.22, 0.24), frameMat);
+    const bottom = new THREE.Mesh(new THREE.BoxGeometry(7.68, 0.22, 0.24), frameMat);
+    const left = new THREE.Mesh(new THREE.BoxGeometry(0.22, 5.5, 0.24), frameMat);
+    const right = new THREE.Mesh(new THREE.BoxGeometry(0.22, 5.5, 0.24), frameMat);
+
+    top.position.set(0, 2.64, -0.06);
+    bottom.position.set(0, -2.64, -0.06);
+    left.position.set(-3.74, 0, -0.06);
+    right.position.set(3.74, 0, -0.06);
+
+    photoMesh.add(top, bottom, left, right);
+
+    const shadowCard = new THREE.Mesh(
+        new THREE.PlaneGeometry(7.8, 5.8),
+        new THREE.MeshBasicMaterial({
+            color: 0x000000,
+            transparent: true,
+            opacity: 0.16,
+            depthWrite: false
+        })
+    );
+    shadowCard.position.set(0.18, -0.22, -0.22);
+    photoMesh.add(shadowCard);
+}
+function buildBalancedPhotoTexture(image, forceBrightCompensation = false) {
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx = canvas.getContext('2d');
+
+    ctx.drawImage(image, 0, 0);
+
+    const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = imgData.data;
+
+    let lumSum = 0;
+    const pixelCount = d.length / 4;
+
+    for (let i = 0; i < d.length; i += 4) {
+        const r = d[i] / 255;
+        const g = d[i + 1] / 255;
+        const b = d[i + 2] / 255;
+                const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        lumSum += lum;
+    }
+
+    const avgLum = lumSum / pixelCount;
+
+    const gain =
+        forceBrightCompensation ? 0.78 :
+        avgLum > 0.78 ? 0.76 :
+        avgLum > 0.68 ? 0.82 :
+        avgLum > 0.58 ? 0.88 : 0.94;
+
+    for (let i = 0; i < d.length; i += 4) {
+        let r = d[i] * gain;
+        let g = d[i + 1] * gain;
+        let b = d[i + 2] * gain;
+
+        if (r > 210) r = 210 + (r - 210) * 0.45;
+        if (g > 210) g = 210 + (g - 210) * 0.45;
+        if (b > 210) b = 210 + (b - 210) * 0.45;
+
+        d[i] = Math.max(0, Math.min(255, r));
+        d[i + 1] = Math.max(0, Math.min(255, g));
+        d[i + 2] = Math.max(0, Math.min(255, b));
+    }
+
+    ctx.putImageData(imgData, 0, 0);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    tex.generateMipmaps = true;
+    tex.minFilter = THREE.LinearMipmapLinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+
+    return tex;
+}
+
+// ==================== 3. 光源系统 ====================
+const starLight = new THREE.PointLight(0xffeecc, 96, 50);
+starLight.position.set(0, 18, 0);
+scene.add(starLight);
+
+const premiumLight = new THREE.DirectionalLight(0xffeecc, 0);
+premiumLight.position.set(12, 38, 18);
+scene.add(premiumLight);
+
+const rimLight = new THREE.DirectionalLight(0xaaccff, 0);
+rimLight.position.set(-25, 15, -28);
+scene.add(rimLight);
+
+const hemiLight = new THREE.HemisphereLight(0x88bbff, 0x113322, 0.35);
+scene.add(hemiLight);
+
+const sideFill = new THREE.PointLight(0xffddaa, 0, 45);
+sideFill.position.set(-18, 6, 22);
+scene.add(sideFill);
+
+const warmWash = new THREE.PointLight(0xffc86a, 0.4, 120);
+warmWash.position.set(0, 11, 26);
+scene.add(warmWash);
+
+const backGold = new THREE.PointLight(0xffd98a, 0.25, 120);
+backGold.position.set(0, 13, -30);
+scene.add(backGold);
+
+// ==================== 4. 几何树元素 ====================
+const treeElements = [];
+// 更细的材质层次
+const matRed = new THREE.MeshPhysicalMaterial({
+    color: 0xc6281b,
+    metalness: 0.18,
+    roughness: 0.30,
+    clearcoat: 0.72,
+    clearcoatRoughness: 0.18,
+    sheen: 0.2,
+    sheenColor: 0xfff5f5,
+    emissive: 0x160404,
+    emissiveIntensity: 0.08
+});
+
+const matGold = new THREE.MeshPhysicalMaterial({
+    color: 0xe0b650,
+    metalness: 1.0,
+    roughness: 0.16,
+    clearcoat: 0.42,
+    clearcoatRoughness: 0.12,
+    emissive: 0x241404,
+    emissiveIntensity: 0.04
+});
+
+const matGreen = new THREE.MeshPhysicalMaterial({
+    color: 0x1c4d24,
+    metalness: 0.12,
+    roughness: 0.52,
+    clearcoat: 0.24,
+    clearcoatRoughness: 0.36,
+    emissive: 0x071407,
+    emissiveIntensity: 0.06
+});
+
+const accentGoldMat = new THREE.MeshPhysicalMaterial({
+    color: 0xd8ae4e,
+    metalness: 0.95,
+    roughness: 0.18,
+    clearcoat: 0.35,
+    clearcoatRoughness: 0.14
+});
+
+const deepGoldGlassMat = new THREE.MeshPhysicalMaterial({
+    color: 0x8b6927,
+    metalness: 0.55,
+    roughness: 0.34,
+    transparent: true,
+    opacity: 0.18,
+    transmission: 0.06
+});
+
+const ivoryMat = new THREE.MeshPhysicalMaterial({
+    color: 0xf7f2ea,
+    metalness: 0.02,
+    roughness: 0.42,
+    clearcoat: 0.26,
+    clearcoatRoughness: 0.22
+});
+
+const softFabricRedMat = new THREE.MeshPhysicalMaterial({
+    color: 0xa91316,
+    metalness: 0.02,
+    roughness: 0.86,
+    sheen: 0.7,
+    sheenColor: 0xffd7d7
+});
+
+const plushWhiteMat = new THREE.MeshPhysicalMaterial({
+    color: 0xfdfbf6,
+    metalness: 0.0,
+    roughness: 0.92,
+    sheen: 0.9,
+    sheenColor: 0xffffff
+});
+
+const bellBodyMat = new THREE.MeshPhysicalMaterial({
+    color: 0xcfa043,
+    metalness: 0.96,
+    roughness: 0.22,
+    clearcoat: 0.4,
+    clearcoatRoughness: 0.16
+});
+
+const jewelGlassMat = new THREE.MeshPhysicalMaterial({
+    color: 0xf2d27a,
+    metalness: 0.15,
+    roughness: 0.08,
+    transmission: 0.22,
+    transparent: true,
+    opacity: 0.55,
+    ior: 1.22,
+    thickness: 0.4
+});
+
+const edgeLineMat = new THREE.LineBasicMaterial({
+    color: 0xffe7b0,
+    transparent: true,
+    opacity: 0.24
+});
+function createCandyStripeTexture() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 256;
+    const ctx = canvas.getContext('2d');
+
+    // 红色底
+    ctx.fillStyle = '#c6281b';
+    ctx.fillRect(0, 0, 256, 256);
+
+    // 斜向白色糖果纹
+    ctx.strokeStyle = '#f8f3ea';
+    ctx.lineWidth = 26;
+    for (let i = -220; i < 460; i += 64) {
+        ctx.beginPath();
+        ctx.moveTo(i, 0);
+        ctx.lineTo(i - 180, 256);
+        ctx.stroke();
+    }
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(1, 2.2);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
+}
+
+const candyStripeTex = createCandyStripeTexture();
+
+const candyMat = new THREE.MeshPhysicalMaterial({
+    map: candyStripeTex,
+    metalness: 0.06,
+    roughness: 0.32,
+    clearcoat: 0.82,
+    clearcoatRoughness: 0.14,
+    sheen: 0.18,
+    sheenColor: 0xffffff
+});
+
+const bellInnerMat = new THREE.MeshPhysicalMaterial({
+    color: 0x8c621f,
+    metalness: 0.72,
+    roughness: 0.30
+});
+
+function createCandyCaneOrnament() {
+    const group = new THREE.Group();
+
+    // 竖直主体
+    const shaft = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.11, 0.11, 0.78, 24),
+        candyMat
+    );
+    shaft.position.y = -0.14;
+    group.add(shaft);
+
+    // 顶部弯钩
+    const hook = new THREE.Mesh(
+        new THREE.TorusGeometry(0.20, 0.11, 18, 40, Math.PI),
+        candyMat
+    );
+    hook.rotation.z = Math.PI / 2;
+    hook.position.set(0.20, 0.25, 0);
+    group.add(hook);
+
+    // 金属帽
+    const cap = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.05, 0.08, 0.08, 12),
+        accentGoldMat
+    );
+    cap.position.set(0.0, 0.62, 0);
+    group.add(cap);
+
+    // 吊环
+    const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.06, 0.012, 8, 18),
+        accentGoldMat
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.set(0.0, 0.69, 0);
+    group.add(ring);
+
+    group.scale.set(0.92, 0.92, 0.92);
+    return group;
+}
+
+function createBellOrnament() {
+    const group = new THREE.Group();
+
+    const points = [
+        new THREE.Vector2(0.00, -0.23),
+        new THREE.Vector2(0.10, -0.21),
+        new THREE.Vector2(0.17, -0.12),
+        new THREE.Vector2(0.21,  0.02),
+        new THREE.Vector2(0.18,  0.16),
+        new THREE.Vector2(0.11,  0.28),
+        new THREE.Vector2(0.05,  0.32),
+        new THREE.Vector2(0.00,  0.32)
+    ];
+
+    const bellBody = new THREE.Mesh(
+        new THREE.LatheGeometry(points, 32),
+        bellBodyMat
+    );
+    bellBody.rotation.x = Math.PI;
+    group.add(bellBody);
+
+    const lip = new THREE.Mesh(
+        new THREE.TorusGeometry(0.17, 0.02, 8, 24),
+        accentGoldMat
+    );
+    lip.rotation.x = Math.PI / 2;
+    lip.position.y = -0.22;
+    group.add(lip);
+
+    const cap = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.04, 0.065, 0.10, 12),
+        accentGoldMat
+    );
+    cap.position.y = 0.34;
+    group.add(cap);
+
+    const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.06, 0.012, 8, 18),
+        accentGoldMat
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.43;
+    group.add(ring);
+
+    const clapper = new THREE.Mesh(
+        new THREE.SphereGeometry(0.038, 12, 12),
+        bellInnerMat
+    );
+    clapper.position.y = -0.10;
+    group.add(clapper);
+
+    group.scale.set(1.05, 1.05, 1.05);
+    return group;
+}
+function addFacetedCore(mesh) {
+    const gem = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.17, 0),
+        jewelGlassMat
+    );
+    gem.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+    mesh.add(gem);
+}
+
+function addLuxuryBoxRibbon(mesh) {
+    const bandMat = ivoryMat;
+        const bandX = new THREE.Mesh(
+        new THREE.BoxGeometry(0.66, 0.10, 0.10),
+        bandMat
+    );
+    const bandY = new THREE.Mesh(
+        new THREE.BoxGeometry(0.10, 0.66, 0.10),
+        bandMat
+    );
+    const knot = new THREE.Mesh(
+        new THREE.SphereGeometry(0.07, 12, 12),
+        accentGoldMat
+    );
+
+    bandX.position.z = 0.31;
+    bandY.position.z = 0.31;
+    knot.position.set(0, 0, 0.34);
+
+    mesh.add(bandX, bandY, knot);
+}
+
+function addCandyStripe(mesh) {
+    const stripeGeo = new THREE.TorusGeometry(0.16, 0.022, 8, 22);
+
+    const stripe1 = new THREE.Mesh(stripeGeo, ivoryMat);
+    const stripe2 = new THREE.Mesh(stripeGeo, ivoryMat);
+    const stripe3 = new THREE.Mesh(stripeGeo, ivoryMat);
+
+    stripe1.rotation.x = Math.PI / 2;
+    stripe2.rotation.x = Math.PI / 2;
+    stripe3.rotation.x = Math.PI / 2;
+
+    stripe1.position.y = 0.26;
+    stripe2.position.y = 0.00;
+    stripe3.position.y = -0.26;
+
+    stripe1.rotation.z = Math.PI / 6;
+    stripe2.rotation.z = -Math.PI / 5;
+    stripe3.rotation.z = Math.PI / 4;
+
+    mesh.add(stripe1, stripe2, stripe3);
+}
+
+function addBell(mesh) {
+    const bellGroup = new THREE.Group();
+
+    const bellBody = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 16, 16, 0, Math.PI * 2, 0, Math.PI * 0.75),
+        bellBodyMat
+    );
+    bellBody.scale.set(1.0, 1.05, 1.0);
+    bellBody.position.y = -0.02;
+
+    const bottomLip = new THREE.Mesh(
+        new THREE.TorusGeometry(0.135, 0.018, 8, 20),
+        accentGoldMat
+    );
+    bottomLip.rotation.x = Math.PI / 2;
+    bottomLip.position.y = -0.12;
+
+    const topCap = new THREE.Mesh(
+        new THREE.SphereGeometry(0.05, 10, 10),
+        accentGoldMat
+    );
+    topCap.position.y = 0.12;
+
+    const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.05, 0.012, 8, 16),
+        accentGoldMat
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 0.19;
+
+    const clapper = new THREE.Mesh(
+        new THREE.SphereGeometry(0.032, 10, 10),
+        new THREE.MeshPhysicalMaterial({
+            color: 0x8b5d18,
+            metalness: 0.75,
+            roughness: 0.28
+        })
+    );
+    clapper.position.y = -0.07;
+
+    bellGroup.add(bellBody, bottomLip, topCap, ring, clapper);
+    bellGroup.scale.setScalar(0.9);
+    bellGroup.position.set(0, 0.48, 0);
+
+    mesh.add(bellGroup);
+}
+
+function addSantaHat(mesh) {
+    const hatGroup = new THREE.Group();
+
+    const cone = new THREE.Mesh(
+        new THREE.ConeGeometry(0.15, 0.34, 18),
+        softFabricRedMat
+    );
+    cone.position.y = 0.18;
+    cone.rotation.z = -0.24;
+
+    const brim = new THREE.Mesh(
+        new THREE.TorusGeometry(0.12, 0.032, 10, 22),
+        plushWhiteMat
+    );
+    brim.rotation.x = Math.PI / 2;
+    brim.position.y = 0.03;
+
+    const pom = new THREE.Mesh(
+        new THREE.SphereGeometry(0.042, 12, 12),
+        plushWhiteMat
+    );
+    pom.position.set(-0.07, 0.33, 0);
+
+    hatGroup.add(cone, brim, pom);
+    hatGroup.position.set(0, 0.46, 0);
+    hatGroup.rotation.z = -0.18;
+
+    mesh.add(hatGroup);
+}
+
+function addFacetedOrnamentCage(mesh) {
+    const ring1 = new THREE.Mesh(
+        new THREE.TorusGeometry(0.20, 0.012, 8, 24),
+        accentGoldMat
+    );
+    const ring2 = new THREE.Mesh(
+        new THREE.TorusGeometry(0.20, 0.012, 8, 24),
+        accentGoldMat
+    );
+    const ring3 = new THREE.Mesh(
+        new THREE.TorusGeometry(0.20, 0.012, 8, 24),
+        accentGoldMat
+    );
+
+    ring1.rotation.x = Math.PI / 2;
+    ring2.rotation.y = Math.PI / 2;
+    ring3.rotation.z = Math.PI / 2;
+
+    mesh.add(ring1, ring2, ring3);
+}
+
+function addElementDetail(mesh, type) {
+    const seed = Math.random();
+
+    // ===== 方块：高级礼盒 / 珠宝盒质感 =====
+    if (type === 0) {
+        if (seed > 0.10) {
+            const edge = new THREE.LineSegments(
+                new THREE.EdgesGeometry(new THREE.BoxGeometry(0.64, 0.64, 0.64)),
+                edgeLineMat
+            );
+            mesh.add(edge);
+        }
+
+        if (seed > 0.38) {
+            const innerCore = new THREE.Mesh(
+                new THREE.BoxGeometry(0.38, 0.38, 0.38),
+                deepGoldGlassMat
+            );
+            mesh.add(innerCore);
+        }
+
+        if (seed > 0.52) {
+            addLuxuryBoxRibbon(mesh);
+        }
+
+        if (seed > 0.74) {
+            addFacetedCore(mesh);
+        }
+    }
+
+    // ===== 金球 / 绿球：高级珠宝挂饰感 =====
+    if (type === 1) {
+        if (seed > 0.18) {
+            const cap = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.08, 0.11, 0.12, 12),
+                accentGoldMat
+            );
+            cap.position.set(0, 0.37, 0);
+            mesh.add(cap);
+
+            const ring = new THREE.Mesh(
+                new THREE.TorusGeometry(0.08, 0.016, 8, 18),
+                accentGoldMat
+            );
+            ring.position.set(0, 0.46, 0);
+            ring.rotation.x = Math.PI / 2;
+            mesh.add(ring);
+        }
+
+        // 给部分金球加切面感外壳
+        if (seed > 0.45) {
+            const facetedShell = new THREE.Mesh(
+                new THREE.OctahedronGeometry(0.29, 1),
+                new THREE.MeshPhysicalMaterial({
+                    color: 0xf0cf74,
+                    metalness: 0.78,
+                    roughness: 0.18,
+                    transparent: true,
+                    opacity: 0.26,
+                    clearcoat: 0.2
+                })
+            );
+            facetedShell.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, 0);
+            mesh.add(facetedShell);
+        }
+
+        if (seed > 0.62) {
+            addFacetedOrnamentCage(mesh);
+        }
+
+        if (seed > 0.82) {
+            addBell(mesh);
+        } else if (seed > 0.70) {
+            addSantaHat(mesh);
+        }
+    }
+
+    // ===== 红色糖果柱：白色缎带纹理 + 高级圣诞摆件感 =====
+    if (type === 2) {
+        const band1 = new THREE.Mesh(
+            new THREE.TorusGeometry(0.16, 0.018, 8, 20),
+            accentGoldMat
+        );
+        const band2 = new THREE.Mesh(
+            new THREE.TorusGeometry(0.16, 0.018, 8, 20),
+            accentGoldMat
+        );
+        band1.rotation.x = Math.PI / 2;
+        band2.rotation.x = Math.PI / 2;
+        band1.position.y = 0.24;
+        band2.position.y = -0.24;
+        mesh.add(band1, band2);
+
+        if (seed > 0.26) {
+            addCandyStripe(mesh);
+        }
+
+        if (seed > 0.72) {
+            const jewelTop = new THREE.Mesh(
+                new THREE.OctahedronGeometry(0.08, 0),
+                jewelGlassMat
+            );
+            jewelTop.position.set(0, 0.44, 0);
+            mesh.add(jewelTop);
+        }
+
+        if (seed > 0.84) {
+            addBell(mesh);
+        }
+    }
+}
+
+for (let i = 0; i < GEO_COUNT; i++) {
+    const type = i % 3;
+    let obj;
+
+    if (type === 0) {
+        // 礼盒 / 珠宝盒
+        const geo = new THREE.BoxGeometry(0.6, 0.6, 0.6);
+        const mat = Math.random() > 0.5 ? matGold : matGreen;
+        obj = new THREE.Mesh(geo, mat);
+        addElementDetail(obj, 0);
+
+    } else if (type === 1) {
+        // 金色球 -> 铃铛；保留少量绿色挂饰
+        if (Math.random() > 0.28) {
+            obj = createBellOrnament();
+        } else {
+            obj = new THREE.Mesh(
+                new THREE.IcosahedronGeometry(0.34, 1),
+                matGreen
+            );
+            addElementDetail(obj, 1);
+        }
+
+    } else {
+        // 红色圆柱 -> 糖果棒
+        obj = createCandyCaneOrnament();
+    }
+
+    const layer = Math.floor(i / (GEO_COUNT / 6));
+    const layerRatio = (i % (GEO_COUNT / 6)) / (GEO_COUNT / 6);
+    const h = layer * 4 - 10 + layerRatio * 3.8;
+    const r = (6 - layer) * 1.8 * (1 - layerRatio * 0.7) + Math.random() * 0.5;
+    const angle = layerRatio * Math.PI * 2 * 2.5;
+
+    const sx = 0.84 + Math.random() * 0.42;
+    const sy = 0.84 + Math.random() * 0.42;
+    const sz = 0.84 + Math.random() * 0.42;
+    obj.scale.multiply(new THREE.Vector3(sx, sy, sz));
+
+    obj.userData = {
+        treePos: new THREE.Vector3(Math.cos(angle) * r, h, Math.sin(angle) * r),
+        scatterPos: new THREE.Vector3(
+            (Math.random() - 0.5) * 80,
+            (Math.random() - 0.5) * 50,
+            (Math.random() - 0.5) * 80
+        ),
+        rot: new THREE.Euler(
+            Math.random() * Math.PI,
+            Math.random() * Math.PI,
+            Math.random() * 0.35
+        ),
+        floatSeed: Math.random() * Math.PI * 2,
+        twirl: 0.003 + Math.random() * 0.008
+    };
+
+    scene.add(obj);
+    treeElements.push(obj);
+}
+
+// 星星：更自然的材质与光晕
+const star = new THREE.Mesh(
+    new THREE.OctahedronGeometry(1.8, 0),
+    new THREE.MeshStandardMaterial({
+        color: 0xffd76a,
+        emissive: 0xffd98f,
+        emissiveIntensity: 0.9,
+        metalness: 0.26,
+        roughness: 0.36
+            })
+);
+star.position.y = 15;
+scene.add(star);
+
+const starCoreAura = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createGlowTexture('rgba(255,248,230,0.92)', 'rgba(255,220,130,0.34)', 'rgba(255,180,40,0)'),
+    transparent: true,
+    opacity: 0.5,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+}));
+starCoreAura.position.set(0, 15, 0);
+starCoreAura.scale.set(5.4, 5.4, 1);
+scene.add(starCoreAura);
+
+const starAura = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createGlowTexture('rgba(255,248,220,1)', 'rgba(255,214,102,0.55)', 'rgba(255,180,40,0)'),
+    transparent: true,
+    opacity: 0.24,
+    blending: THREE.NormalBlending,
+    depthWrite: false
+}));
+starAura.position.set(0, 15, 0);
+starAura.scale.set(12.6, 12.6, 1);
+scene.add(starAura);
+
+const treeHalo = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createGlowTexture('rgba(255,227,150,0.34)', 'rgba(255,196,72,0.14)', 'rgba(255,180,40,0)'),
+    transparent: true,
+    opacity: 0.52,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+}));
+treeHalo.position.set(0, 7, -10);
+treeHalo.scale.set(38, 30, 1);
+scene.add(treeHalo);
+
+// ==================== 5. 文字 ====================
+const christmasTextGroup = new THREE.Group();
+christmasTextGroup.position.set(0, 22, -4);
+scene.add(christmasTextGroup);
+
+const christmasTextGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createGlowTexture('rgba(255,232,184,0.22)', 'rgba(255,205,94,0.07)', 'rgba(255,188,40,0)'),
+    transparent: true,
+    opacity: 0.16,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+}));
+christmasTextGlow.scale.set(29.2, 7.1, 1);
+christmasTextGlow.position.set(0, 0.16, -1.0);
+christmasTextGroup.add(christmasTextGlow);
+
+const christmasTextShadow = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createEmbossedTextTexture(),
+    transparent: true,
+    opacity: 0.20,
+    color: 0x3b2408,
+    blending: THREE.NormalBlending,
+    depthWrite: false
+}));
+christmasTextShadow.scale.set(28.4, 6.8, 1);
+christmasTextShadow.position.set(0.34, -0.22, -0.6);
+christmasTextGroup.add(christmasTextShadow);
+
+const christmasText = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: createEmbossedTextTexture(),
+    transparent: true,
+    opacity: 0.98,
+    blending: THREE.NormalBlending,
+    depthWrite: false
+}));
+christmasText.scale.set(28, 6.6, 1);
+christmasTextGroup.add(christmasText);
+
+// ==================== 6. 光尘 ====================
+const sparkleCount = 260;
+const sparklePositions = new Float32Array(sparkleCount * 3);
+for (let i = 0; i < sparkleCount; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 4 + Math.random() * 16;
+    sparklePositions[i * 3] = Math.cos(angle) * radius;
+    sparklePositions[i * 3 + 1] = -7 + Math.random() * 30;
+    sparklePositions[i * 3 + 2] = (Math.random() - 0.5) * 24;
+}
+const sparkleGeo = new THREE.BufferGeometry();
+sparkleGeo.setAttribute('position', new THREE.BufferAttribute(sparklePositions, 3));
+
+const sparkleMat = new THREE.PointsMaterial({
+    size: 0.38,
+    map: createGlowTexture('rgba(255,250,238,1)', 'rgba(255,226,130,0.55)', 'rgba(255,180,40,0)'),
+    transparent: true,
+    opacity: 0.62,
+    color: 0xffefbf,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+});
+const goldDust = new THREE.Points(sparkleGeo, sparkleMat);
+goldDust.position.y = 1;
+scene.add(goldDust);
+
+// ==================== 7. 图片 ====================
+let photoPlanes = [];
+const loader = new THREE.TextureLoader();
+
+function initMemoryPhotos() {
+    MEMORY_PHOTOS.forEach((src) => {
+        loader.load(src, (rawTex) => {
+            const isVeryBrightPhoto = src.includes('274ada878125b328de82eab20ceba4ef.jpg');
+
+            const tex = buildBalancedPhotoTexture(rawTex.image, isVeryBrightPhoto);
+
+            const plane = new THREE.Mesh(
+                new THREE.PlaneGeometry(7, 5),
+                new THREE.MeshBasicMaterial({
+                    map: tex,
+                    color: 0xe2d6c3,
+                    transparent: true,
+                    opacity: 0,
+                    side: THREE.FrontSide,
+                    toneMapped: false
+                })
+            );
+
+            addPhotoFrame(plane);
+            plane.scale.setScalar(0.1);
+
+            const phi = Math.random() * Math.PI * 2;
+            const theta = Math.random() * Math.PI;
+            const radius = 25 + Math.random() * 10;
+
+            plane.userData = {
+                originPos: new THREE.Vector3(0, 0, 0),
+                scatterPos: new THREE.Vector3().setFromSphericalCoords(radius, theta, phi)
+            };
+
+            scene.add(plane);
+            photoPlanes.push(plane);
+        });
+    });
+}
+initMemoryPhotos();
+
+// ==================== 8. 手势识别 ====================
+let handLandmarker;
+const video = document.getElementById('video-feed');
+let lastVideoTime = -1;
+
+async function initMP() {
+    const loadingEl = document.getElementById('loading-screen');
+
+    // 先开摄像头
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                facingMode: "user",
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            },
+            audio: false
+        });
+
+        video.srcObject = stream;
+        video.muted = true;
+
+        video.onloadeddata = () => {
+            loadingEl.style.display = 'none';
+            if (!window.__animStarted) {
+                window.__animStarted = true;
+                animate();
+            }
+        };
+
+        await video.play().catch(() => {});
+    } catch (err) {
+        console.error("Camera access failed:", err);
+        loadingEl.innerText = "摄像头打开失败：请检查浏览器权限 / HTTPS / 是否被其他应用占用";
+        return;
+    }
+
+    // 再加载手势模型
+    try {
+        const vision = await FilesetResolver.forVisionTasks(
+            "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+            baseOptions: {
+                modelAssetPath:
+                    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            },
+            runningMode: "VIDEO",
+            numHands: 1
+        });
+    } catch (err) {
+        console.error("MediaPipe init failed:", err);
+
+        const stateEl = document.getElementById("state-txt");
+        if (stateEl) {
+            stateEl.innerText = "摄像头已打开，手势模型加载失败";
+        }
+
+        if (loadingEl.style.display !== "none") {
+            loadingEl.style.display = "none";
+        }
+
+        if (!window.__animStarted) {
+            window.__animStarted = true;
+            animate();
+        }
+    }
+}
+function lmDist(a, b) {
+    return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function smoothLandmarks(newLm, alpha = 0.40) {
+    if (!smoothedLandmarks) {
+        smoothedLandmarks = newLm.map(p => ({ x: p.x, y: p.y, z: p.z }));
+        return smoothedLandmarks;
+    }
+
+    smoothedLandmarks = smoothedLandmarks.map((p, i) => ({
+        x: p.x + (newLm[i].x - p.x) * alpha,
+        y: p.y + (newLm[i].y - p.y) * alpha,
+        z: p.z + (newLm[i].z - p.z) * alpha
+    }));
+
+    return smoothedLandmarks;
+}
+
+function getPalmScale(lm) {
+    const wristToPalm = lmDist(lm[0], lm[9]);
+    const palmWidth = lmDist(lm[5], lm[17]);
+    return Math.max((wristToPalm + palmWidth) * 0.5, 0.001);
+}
+
+function isFingerExtended(lm, tip, pip, mcp) {
+    const scale = getPalmScale(lm);
+    const wrist = lm[0];
+
+    const tipPalm = lmDist(lm[tip], wrist) / scale;
+    const pipPalm = lmDist(lm[pip], wrist) / scale;
+    const tipMcp = lmDist(lm[tip], lm[mcp]) / scale;
+
+    return tipPalm > pipPalm + 0.10 && tipMcp > 0.58;
+}
+
+function isFingerCurled(lm, tip, pip, mcp) {
+    const scale = getPalmScale(lm);
+    const wrist = lm[0];
+
+    const tipPalm = lmDist(lm[tip], wrist) / scale;
+    const pipPalm = lmDist(lm[pip], wrist) / scale;
+    const tipMcp = lmDist(lm[tip], lm[mcp]) / scale;
+
+    return tipPalm < pipPalm + 0.03 || tipMcp < 0.50;
+}
+
+function getGestureMetrics(lm) {
+    const scale = getPalmScale(lm);
+
+    const indexOpen  = isFingerExtended(lm, 8, 6, 5);
+    const middleOpen = isFingerExtended(lm, 12, 10, 9);
+    const ringOpen   = isFingerExtended(lm, 16, 14, 13);
+    const pinkyOpen  = isFingerExtended(lm, 20, 18, 17);
+
+    const indexCurled  = isFingerCurled(lm, 8, 6, 5);
+    const middleCurled = isFingerCurled(lm, 12, 10, 9);
+    const ringCurled   = isFingerCurled(lm, 16, 14, 13);
+    const pinkyCurled  = isFingerCurled(lm, 20, 18, 17);
+
+    const extendedCount = [indexOpen, middleOpen, ringOpen, pinkyOpen].filter(Boolean).length;
+    const curledCount   = [indexCurled, middleCurled, ringCurled, pinkyCurled].filter(Boolean).length;
+
+    const pinchNorm = lmDist(lm[4], lm[8]) / scale;
+    const spreadNorm =
+        (lmDist(lm[8], lm[12]) + lmDist(lm[12], lm[16]) + lmDist(lm[16], lm[20])) / (3 * scale);
+
+    const avgTipPalm =
+        (lmDist(lm[8], lm[9]) + lmDist(lm[12], lm[9]) + lmDist(lm[16], lm[9]) + lmDist(lm[20], lm[9])) / (4 * scale);
+
+    return {
+        scale,
+        extendedCount,
+        curledCount,
+        pinchNorm,
+        spreadNorm,
+        avgTipPalm
+    };
+}
+
+function findNearestPhoto(targetWorld) {
+    let best = null;
+    let bestScore = Infinity;
+
+    photoPlanes.forEach((plane) => {
+        if (plane.scale.x < 0.12) return;
+
+        let score = plane.position.distanceTo(targetWorld);
+
+        if (plane === activePhoto) score *= 0.82;
+
+        if (score < bestScore) {
+            bestScore = score;
+            best = plane;
+        }
+    });
+
+    return bestScore < 26 ? best : activePhoto;
+}
+function solveGesture(lm) {
+    const g = getGestureMetrics(lm);
+
+    const scores = {
+        TREE: 0,
+        SCATTER: 0,
+        FOCUS: 0
+    };
+        // FOCUS: pinch
+    if (g.pinchNorm < 0.31) scores.FOCUS += 2.0;
+    if (g.pinchNorm < 0.36) scores.FOCUS += 0.8;
+
+    // SCATTER: open hand
+    if (g.extendedCount >= 4) scores.SCATTER += 1.8;
+    if (g.spreadNorm > 0.60) scores.SCATTER += 0.8;
+    if (g.avgTipPalm > 1.12) scores.SCATTER += 0.7;
+    if (g.pinchNorm > 0.42) scores.SCATTER += 0.2;
+
+    // TREE: fist / curled hand
+    if (g.curledCount >= 4) scores.TREE += 1.8;
+    if (g.avgTipPalm < 0.86) scores.TREE += 0.9;
+    if (g.spreadNorm < 0.45) scores.TREE += 0.5;
+
+    // hysteresis
+    scores[stableGesture] += 0.18;
+
+    gestureConfidence.TREE    = gestureConfidence.TREE * 0.72 + scores.TREE * 0.28;
+    gestureConfidence.SCATTER = gestureConfidence.SCATTER * 0.72 + scores.SCATTER * 0.28;
+    gestureConfidence.FOCUS   = gestureConfidence.FOCUS * 0.72 + scores.FOCUS * 0.28;
+
+    const ranked = Object.entries(gestureConfidence).sort((a, b) => b[1] - a[1]);
+
+    if (ranked[0][1] - ranked[1][1] < 0.08) {
+        return stableGesture;
+    }
+
+    stableGesture = ranked[0][0];
+    return stableGesture;
+}
+
+// ==================== 9. 主循环 ====================
+function animate() {
+    requestAnimationFrame(animate);
+    const time = Date.now() * 0.001;
+
+    if (handLandmarker && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const results = handLandmarker.detectForVideo(video, performance.now());
+
+        if (results.landmarks && results.landmarks[0]) {
+            const rawLm = results.landmarks[0];
+            const lm = smoothLandmarks(rawLm, 0.40);
+
+            appState = solveGesture(lm);
+            document.getElementById('state-txt').innerText = appState;
+
+            tempPalmTarget.set(
+                (0.5 - lm[9].x) * 45,
+                (0.5 - lm[9].y) * 35,
+                10
+            );
+
+            const pinchMidX = (lm[4].x + lm[8].x) * 0.5;
+            const pinchMidY = (lm[4].y + lm[8].y) * 0.5;
+
+            tempPinchTarget.set(
+                (0.5 - pinchMidX) * 45,
+                (0.5 - pinchMidY) * 35,
+                10
+            );
+
+            const desiredTarget = appState === STATE.FOCUS ? tempPinchTarget : tempPalmTarget;
+            const followAlpha =
+                appState === STATE.FOCUS ? 0.46 :
+                appState === STATE.SCATTER ? 0.24 :
+                0.20;
+
+            lastHandPos.lerp(desiredTarget, followAlpha);
+
+            if (appState === STATE.SCATTER) {
+                const handX = THREE.MathUtils.clamp((0.5 - lm[9].x) / 0.42, -1, 1);
+                orbitAngleTarget = handX * 1.15;
+            }
+        }
+    }
+
+    const target = {
+        premium:  appState === STATE.TREE ? 4.1  : (appState === STATE.SCATTER ? 1.34 : 0.74),
+        rim:      appState === STATE.TREE ? 2.85 : (appState === STATE.SCATTER ? 1.08 : 0.46),
+        star:     appState === STATE.TREE ? 108  : (appState === STATE.SCATTER ? 72   : 50),
+        hemi:     appState === STATE.TREE ? 0.78 : (appState === STATE.SCATTER ? 0.46 : 0.3),
+        side:     appState === STATE.TREE ? 1.52 : (appState === STATE.SCATTER ? 0.62 : 0.34),
+        warmWash: appState === STATE.TREE ? 1.62 : (appState === STATE.SCATTER ? 0.88 : 0.48),
+        backGold: appState === STATE.TREE ? 1.16 : (appState === STATE.SCATTER ? 0.66 : 0.36),
+        bloom:    appState === STATE.TREE ? 1.68 : (appState === STATE.SCATTER ? 1.16 : 0.84),
+        exposure: appState === STATE.TREE ? 1.08 : (appState === STATE.SCATTER ? 1.03 : 0.99),
+        halo:     appState === STATE.TREE ? 0.62 : (appState === STATE.SCATTER ? 0.48 : 0.36)
+    };
+
+    premiumLight.intensity       += (target.premium  - premiumLight.intensity)       * 0.12;
+    rimLight.intensity           += (target.rim      - rimLight.intensity)           * 0.12;
+    starLight.intensity          += (target.star     - starLight.intensity)          * 0.12;
+    hemiLight.intensity          += (target.hemi     - hemiLight.intensity)          * 0.12;
+    sideFill.intensity           += (target.side     - sideFill.intensity)           * 0.12;
+    warmWash.intensity           += (target.warmWash - warmWash.intensity)           * 0.12;
+    backGold.intensity           += (target.backGold - backGold.intensity)           * 0.12;
+    bloomPass.strength           += (target.bloom    - bloomPass.strength)           * 0.12;
+    renderer.toneMappingExposure += (target.exposure - renderer.toneMappingExposure) * 0.08;
+    treeHalo.material.opacity    += (target.halo     - treeHalo.material.opacity)    * 0.08;
+
+    // 参考 tree_merry2 的丝滑感，保留 tree_mc 的跟手逻辑
+    tempScatterTargetOffset.set(lastHandPos.x * 0.48, lastHandPos.y * 0.28, 0);
+    scatterHandOffset.lerp(
+        appState === STATE.SCATTER ? tempScatterTargetOffset : tempZeroVec.set(0, 0, 0),
+        appState === STATE.SCATTER ? 0.14 : 0.10
+    );
+
+    if (appState === STATE.SCATTER) {
+        controls.enabled = false;
+        orbitAngleCurrent = THREE.MathUtils.lerp(orbitAngleCurrent, orbitAngleTarget, 0.08);
+
+        tempCamTargetPos.set(
+            Math.sin(orbitAngleCurrent) * orbitBaseRadius,
+            orbitBaseHeight + Math.sin(time * 0.8) * 0.5,
+            Math.cos(orbitAngleCurrent) * orbitBaseRadius
+        );
+
+        camera.position.lerp(tempCamTargetPos, 0.10);
+        controls.target.lerp(orbitLookAt, 0.12);
+        camera.lookAt(controls.target);
+    } else {
+        controls.enabled = true;
+        orbitAngleTarget *= 0.90;
+        orbitAngleCurrent = THREE.MathUtils.lerp(orbitAngleCurrent, 0, 0.06);
+        camera.position.lerp(defaultCameraPos, 0.06);
+        controls.target.lerp(orbitLookAt, 0.08);
+    }
+
+    treeElements.forEach((mesh, idx) => {
+        const isScatter = appState === STATE.SCATTER;
+        const isFocus = appState === STATE.FOCUS;
+
+        if (isScatter) {
+            tempLocalFloat.set(
+                Math.sin(time * 1.1 + idx * 0.17) * 0.28,
+                Math.cos(time * 1.25 + idx * 0.11) * 0.22,
+                Math.sin(time * 0.9 + idx * 0.19) * 0.20
+            );
+
+            tempTargetPos.copy(mesh.userData.scatterPos)
+                .add(scatterHandOffset)
+                .add(tempLocalFloat);
+        } else if (isFocus) {
+            tempTargetPos.copy(mesh.userData.scatterPos);
+        } else {
+            tempTargetPos.copy(mesh.userData.treePos);
+        }
+
+        mesh.position.lerp(tempTargetPos, isScatter ? 0.12 : 0.08);
+
+        if (isScatter || isFocus) {
+            mesh.rotation.x += 0.02;
+            mesh.rotation.y += 0.02;
+        } else {
+            mesh.rotation.x += (mesh.userData.rot.x - mesh.rotation.x) * 0.12;
+            mesh.rotation.y += (mesh.userData.rot.y - mesh.rotation.y) * 0.12;
+            mesh.rotation.z += (mesh.userData.rot.z - mesh.rotation.z) * 0.12;
+            mesh.position.y += Math.sin(time * 1.5 + mesh.userData.floatSeed + idx * 0.01) * 0.0035;
+        }
+
+        mesh.rotation.y += mesh.userData.twirl * 0.14;
+
+        mesh.children.forEach((child, cidx) => {
+            if (child.type === 'Group') {
+                if (child.userData.baseRotZ === undefined) {
+                    child.userData.baseRotZ = child.rotation.z;
+                }
+                child.rotation.z = child.userData.baseRotZ + Math.sin(time * 1.6 + idx * 0.13 + cidx) * 0.03;
+            }
+        });
+    });
+
+    if (appState === STATE.FOCUS) {
+        const nearestFocusPhoto = findNearestPhoto(lastHandPos);
+        if (!activePhoto) {
+            activePhoto = nearestFocusPhoto;
+        } else if (nearestFocusPhoto && nearestFocusPhoto !== activePhoto) {
+            const activeDist = activePhoto.position.distanceTo(lastHandPos);
+            const newDist = nearestFocusPhoto.position.distanceTo(lastHandPos);
+            if (newDist + 3 < activeDist) {
+                activePhoto = nearestFocusPhoto;
+            }
+        }
+    }
+
+    photoPlanes.forEach((plane, idx) => {
+        if (appState === STATE.SCATTER) {
+            const angleOffset = (idx / Math.max(photoPlanes.length, 1)) * Math.PI * 2;
+            const timeRot = time * 0.35 + orbitAngleCurrent * 0.8;
+            const r = 26;
+
+            tempPhotoScatterPos.set(
+                Math.cos(angleOffset + timeRot) * r + scatterHandOffset.x * 0.92,
+                Math.sin(time * 0.9 + idx * 0.8) * 5 + 5 + scatterHandOffset.y * 0.18,
+                Math.sin(angleOffset + timeRot) * r
+            );
+
+            plane.userData.scatterPos.copy(tempPhotoScatterPos);
+            plane.position.lerp(plane.userData.scatterPos, 0.09);
+            plane.scale.lerp(tempTargetPos.set(1.06, 1.06, 1.06), 0.10);
+            plane.material.opacity += (0.95 - plane.material.opacity) * 0.10;
+            plane.lookAt(camera.position);
+
+        } else if (appState === STATE.FOCUS) {
+            if (plane === activePhoto) {
+                plane.position.lerp(lastHandPos, 0.32);
+                plane.scale.lerp(tempTargetPos.set(2.35, 2.35, 2.35), 0.18);
+                plane.material.opacity = 1.0;
+                plane.lookAt(camera.position);
+            } else {
+                plane.material.opacity *= 0.92;
+            }
+
+        } else {
+            plane.position.lerp(plane.userData.originPos, 0.12);
+            plane.scale.lerp(tempTargetPos.set(0.01, 0.01, 0.01), 0.20);
+            plane.material.opacity *= 0.8;
+            if (plane === activePhoto) activePhoto = null;
+        }
+    });
+
+    tempDustTargetPos.copy(
+        appState === STATE.SCATTER
+            ? tempTargetPos.set(scatterHandOffset.x * 0.18, 1 + scatterHandOffset.y * 0.08, 0)
+            : tempTargetPos.set(0, 1, 0)
+    );
+    goldDust.position.lerp(tempDustTargetPos, 0.08);
+
+    const starPulse = 1 + Math.sin(time * 2.08) * 0.045;
+    const starBreath = 1 + Math.sin(time * 1.2 + 0.7) * 0.03;
+    const haloPulse = 1 + Math.sin(time * 1.8) * 0.08;
+
+    star.material.emissiveIntensity = 0.9 + Math.sin(time * 2.0) * 0.07;
+    starCoreAura.scale.set(5.4 * starPulse, 5.4 * starPulse, 1);
+    starCoreAura.material.opacity = 0.50 + Math.sin(time * 2.2) * 0.04;
+    starAura.scale.set(12.6 * starBreath, 12.6 * starBreath, 1);
+    starAura.material.opacity = 0.24 + Math.sin(time * 1.8) * 0.025;
+
+    christmasTextGroup.position.y = 22 + Math.sin(time * 1.3) * 0.18;
+    christmasTextGlow.scale.set(29.2 * haloPulse, 7.1 * haloPulse, 1);
+    christmasTextGlow.material.opacity = 0.12 + Math.sin(time * 2.0) * 0.018;
+
+    treeHalo.scale.set(
+        38 * (0.98 + Math.sin(time * 0.9) * 0.02),
+        30 * (0.98 + Math.sin(time * 0.9) * 0.02),
+        1
+    );
+
+    goldDust.rotation.y += 0.0018;
+    star.rotation.y += 0.05;
+
+    if (controls.enabled) {
+        controls.update();
+    }
+
+    composer.render();
+}
+
+initMP();
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>d
